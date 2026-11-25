@@ -33,6 +33,7 @@ class Config:
     api_key: str
     base_url: str = "https://api.tokenclub.cc/v1"
     cleanup_inputs: tuple[Path, ...] = ()
+    cleanup_whole_release: bool = False
 
 
 def load_config(options, local=False):
@@ -58,7 +59,7 @@ def load_config(options, local=False):
                   options["auto_import"], options["embed_tracks"], options["preferred_audio"].strip(),
                   options["keep_original_audio_default"], options["tokenclub_model"].strip(),
                   options["tokenclub_api_key"].strip(), options.get("tokenclub_base_url", "https://api.tokenclub.cc/v1").rstrip("/"),
-                  cleanup)
+                  cleanup, options.get("cleanup_whole_release", False))
 
 
 def read_override(values):
@@ -157,7 +158,8 @@ class Organizer:
                 return
         if automatic and config.cleanup_inputs and self.database.is_file():
             try:
-                removed, cleanup_notes = cleanup_pending(self.database, config.cleanup_inputs)
+                removed, cleanup_notes = cleanup_pending(self.database, config.cleanup_inputs,
+                                                         whole_release=config.cleanup_whole_release)
                 if removed:
                     self.report(f"Очистка входной папки · удалено файлов: {removed}")
                 for note in cleanup_notes:
@@ -217,11 +219,18 @@ class Organizer:
         stamp = self.observed[key][0]
         if release_stamp(card.release) != stamp:
             raise ValueError("Входные файлы изменились. Дождись нового сканирования.")
-        notes = import_jobs(card.jobs, self.config, self.database, self.report)
+        folder = card.release.folder
+        whole_folder = folder if (
+            self.config.cleanup_whole_release and folder.parent in self.config.cleanup_inputs
+            and not any(other.release.key != key and other.release.folder.is_relative_to(folder)
+                        for other in self.cards.values())
+        ) else None
+        notes = import_jobs(card.jobs, self.config, self.database, self.report, whole_folder=whole_folder)
         removed = 0
         if self.config.cleanup_inputs:
             try:
-                removed, cleanup_notes = cleanup_pending(self.database, self.config.cleanup_inputs)
+                removed, cleanup_notes = cleanup_pending(self.database, self.config.cleanup_inputs,
+                                                         whole_release=self.config.cleanup_whole_release)
                 notes.extend(cleanup_notes)
             except (OSError, sqlite3.Error) as exc:
                 notes.append(f"Очистка входной папки: {exc}")

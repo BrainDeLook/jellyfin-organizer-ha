@@ -91,6 +91,29 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(audio.exists())
         self.assertTrue(job.target.exists())
 
+    def test_whole_release_removes_extra_files_after_verified_import(self):
+        poster = self.release / "cover.jpg"
+        poster.write_bytes(b"poster")
+        (self.release / "Empty").mkdir()
+        sibling = self.inbox / "Other series"
+        sibling.mkdir()
+        job = self.job(1)
+
+        import_jobs([job], self.config, self.database, lambda _: None, whole_folder=self.release)
+        self.assertEqual(cleanup_pending(self.database, (self.inbox,)), (0, []))
+        self.assertEqual(cleanup_pending(self.database, (self.inbox,), whole_release=True), (2, []))
+        self.assertFalse(self.release.exists())
+        self.assertTrue(sibling.is_dir())
+        self.assertTrue(job.target.is_file())
+
+    def test_whole_release_keeps_new_files(self):
+        job = self.job(1)
+        import_jobs([job], self.config, self.database, lambda _: None, whole_folder=self.release)
+        added = self.release / "New episode.mkv"
+        added.write_bytes(b"added after import")
+        self.assertEqual(cleanup_pending(self.database, (self.inbox,), whole_release=True), (1, []))
+        self.assertTrue(added.is_file())
+
     def test_retries_only_files_it_could_not_remove(self):
         first, second = self.job(1), self.job(2)
         self.run_import([first, second])

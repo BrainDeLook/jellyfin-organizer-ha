@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 
-from organizer import VIDEOS, fingerprint
+from organizer import BROKEN, VIDEOS, fingerprint
 
 
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
@@ -157,7 +157,27 @@ def job_inputs(job):
     )}
 
 
-def queue_cleanup(connection, jobs, roots, warnings):
+def snapshot_release(folder):
+    files, directories = {}, []
+    def fail(error):
+        raise error
+
+    for directory, children, names in os.walk(folder, onerror=fail):
+        parent = Path(directory)
+        directories.append(str(parent))
+        for name in (*children, *names):
+            path = parent / name
+            if path.resolve() != path or BROKEN.search(name):
+                raise ValueError(f"Папка содержит ссылку или незавершённый файл: {name}")
+        for name in names:
+            path = parent / name
+            if not path.is_file():
+                raise ValueError(f"Папка содержит специальный файл: {name}")
+            files[str(path)] = fingerprint(path)
+    return files, directories
+
+
+def queue_cleanup(connection, jobs, roots, warnings, whole):
     if not roots:
         return
     folder = next((root for root in roots if all(job.entry.source.is_relative_to(root) for job in jobs)), None)
@@ -173,17 +193,26 @@ def queue_cleanup(connection, jobs, roots, warnings):
         inputs.update(record["inputs"])
         outputs.update(record["outputs"])
         skipped.update(record["skipped"])
-    for path in skipped:
-        inputs.pop(path, None)
+    directories = []
+    if whole is None:
+        for path in skipped:
+            inputs.pop(path, None)
+    else:
+        files, directories = whole
+        if any(files.get(path) != tuple(expected) for path, expected in inputs.items()):
+            warnings.append("Папка релиза изменилась во время импорта. Очистка пропущена.")
+            return
+        inputs = files
     if not inputs:
         return
-    payload = json.dumps({"root": str(folder), "inputs": inputs, "outputs": outputs}, ensure_ascii=False, sort_keys=True)
+    payload = json.dumps({"root": str(folder), "inputs": inputs, "outputs": outputs, "directories": directories},
+                         ensure_ascii=False, sort_keys=True)
     with connection:
         connection.execute("INSERT OR IGNORE INTO cleanup_queue VALUES (?, ?)",
                            (sha256(payload.encode()).hexdigest(), payload))
 
 
-def cleanup_pending(database, roots):
+def cleanup_pending(database, roots, *, whole_release=False):
     removed, warnings = 0, []
     allowed = {str(root) for root in roots}
     with closing(open_state(database)) as connection:
@@ -191,6 +220,8 @@ def cleanup_pending(database, roots):
         for key, details in rows:
             batch = json.loads(details)
             if batch["root"] not in allowed:
+                continue
+            if batch.get("directories") and not whole_release:
                 continue
             root = Path(batch["root"])
             if not root.is_dir() or root.resolve() != root:
@@ -218,7 +249,8 @@ def cleanup_pending(database, roots):
                 warnings.append(f"Очистка отложена. Не удалось проверить или синхронизировать итоговые файлы: {exc}.")
                 continue
 
-            pending, parents = {}, set()
+            pending = {}
+            parents = {Path(name) for name in batch.get("directories", ())}
             for name, expected in batch["inputs"].items():
                 path = Path(name)
                 try:
@@ -238,7 +270,7 @@ def cleanup_pending(database, roots):
                     warnings.append(f"Очистка отложена для {path.name}: {exc}.")
             for folder in sorted(parents, key=lambda path: len(path.parts), reverse=True):
                 try:
-                    if folder.resolve() == folder:
+                    if folder != root and folder.is_relative_to(root) and folder.resolve() == folder:
                         folder.rmdir()
                 except OSError as exc:
                     if exc.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
@@ -253,8 +285,14 @@ def cleanup_pending(database, roots):
     return removed, warnings
 
 
-def import_jobs(jobs, config, database, report):
+def import_jobs(jobs, config, database, report, *, whole_folder=None):
     warnings = []
+    whole = None
+    if whole_folder is not None:
+        try:
+            whole = snapshot_release(whole_folder)
+        except (OSError, ValueError) as exc:
+            warnings.append(f"Полная очистка папки пропущена. {exc}")
     with closing(open_state(database)) as connection:
         for job in jobs:
             paths = [job.target]
@@ -328,5 +366,5 @@ def import_jobs(jobs, config, database, report):
                         final.unlink()
                     raise
         if jobs:
-            queue_cleanup(connection, jobs, config.cleanup_inputs, warnings)
+            queue_cleanup(connection, jobs, config.cleanup_inputs, warnings, whole)
     return warnings

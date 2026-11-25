@@ -1,0 +1,32 @@
+name: ARM64 add-on
+on:
+  push:
+    paths:
+      - 'jellyfin_organizer/**'
+      - '.github/workflows/check.yml'
+  pull_request:
+    paths:
+      - 'jellyfin_organizer/**'
+      - '.github/workflows/check.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Build add-on on ARM64
+        run: docker build --tag jellyfin-organizer-test jellyfin_organizer
+      - name: Run organizer regression tests
+        run: >-
+          docker run --rm
+          --mount type=bind,source="$PWD/jellyfin_organizer/tests",target=/tests,readonly
+          --entrypoint /opt/organizer/bin/python
+          jellyfin-organizer-test -m unittest discover -s /tests -v
+      - name: Check web service imports
+        run: >-
+          docker run --rm --entrypoint /opt/organizer/bin/python
+          jellyfin-organizer-test -c "from web import Handler; assert Handler"

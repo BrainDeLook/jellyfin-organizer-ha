@@ -1,0 +1,5 @@
+guessit==3.8.0
+rebulk==6.0.3
+babelfish==0.6.1
+python-dateutil==4.0.0
+tzdata==2026.6

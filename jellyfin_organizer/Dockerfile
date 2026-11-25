@@ -14,7 +14,7 @@ RUN python3 -m venv /opt/organizer \
     && /opt/organizer/bin/python -c "from guessit import guessit; assert guessit('Show.S01E01.mkv')['episode'] == 1" \
     && ffmpeg -version >/dev/null && ffprobe -version >/dev/null \
     && apk del .python-build
-COPY organizer.py media.py web.py ./
+COPY organizer.py media.py web.py catalog.py anime_mapping.py ./
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 ENTRYPOINT ["/sbin/tini", "-g", "--"]
 CMD ["/opt/organizer/bin/python", "web.py"]

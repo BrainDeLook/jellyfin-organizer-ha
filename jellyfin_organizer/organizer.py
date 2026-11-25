@@ -32,10 +32,16 @@ LANGUAGES = {
     "pt": "por", "por": "por", "portuguese": "por",
 }
 EPISODE = re.compile(r"(?<!\w)(?:s(\d{1,3})[ ._-]*e(\d{1,4})|(\d{1,2})x(\d{1,4}))(?!\d)", re.I)
-SEASON = re.compile(r"^(?:season|сезон|s)[ ._-]*(\d{1,3})$", re.I)
-SEASON_TAG = re.compile(r"(?<!\w)(?:season|сезон|s)[ ._-]*(\d{1,3})(?!\w)", re.I)
-SEASON_REVERSE = re.compile(r"(?<!\w)(\d{1,3})[ ._-]+(?:season|сезон)(?!\w)", re.I)
-EPISODE_TAG = re.compile(r"(?<!\w)(?:episode|ep|эпизод|серия)[ ._-]*(\d{1,4})(?!\w)", re.I)
+SEASON_MARKER = (r"(?:(?:season|сезон|s|tv[ ._-]+)[ ._-]*(\d{1,3})"
+                 r"|(\d{1,3})(?:(?:st|nd|rd|th)[ ._-]+season|[ ._-]+season(?![ ._-]*\d)"
+                 r"|(?:[-‑](?:й|ый|ой|ий))?[ ._-]+сезон))")
+SEASON = re.compile(SEASON_MARKER, re.I)
+SEASON_TAG = re.compile(rf"(?<!\w){SEASON_MARKER}(?!\w)", re.I)
+EPISODE_MARKER = r"(?:episodes?|ep|эпизод(?:ы)?|сери[яию]|выпуск)"
+EPISODE_TAG = re.compile(rf"(?<!\w){EPISODE_MARKER}[ ._-]*(\d{{1,4}})(?!\w|[-‑](?:й|я|ая)\b)", re.I)
+EPISODE_REVERSE = re.compile(rf"(?<!\w)(\d{{1,4}})(?:[-‑](?:я|ая|й))?[ ._-]+{EPISODE_MARKER}(?!\w)", re.I)
+EPISODE_RANGE = re.compile(r"^\s*[-–]\s*(\d{1,4})(?!\w)")
+AFTER_SEASON = re.compile(r"^[\s._\-\[\]()]+(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?(?:v\d+)?(?=$|[\s._\[\]()])", re.I)
 DATED = re.compile(r"(?<!\d)(?:19|20)\d{2}[ ._-](?:0[1-9]|1[0-2])[ ._-](?:0[1-9]|[12]\d|3[01])(?!\d)")
 NUMBERED = re.compile(r"(?:\[(\d{1,3})\]|(?:^| - )(\d{1,3})(?:v\d+)?(?=[ ._\[\(]|$))", re.I)
 PACK = re.compile(r"(?<!\w)(?:complete|collection|pack|полный сезон|все серии)(?!\w)|\[\d{1,3}\s*-\s*\d{1,3}\]", re.I)
@@ -45,7 +51,7 @@ TECH = re.compile(r"(?<!\w)(?:[248]k|(?:480|540|576|720|1080|1440|2160|4320)[pi]
                   r"hdtv|remux|x26[45]|h[ ._-]?26[45]|hevc|hdr10(?:\+)?|dolby[ ._-]*vision|av1)(?!\w)", re.I)
 YEAR = re.compile(r"(?<!\d)(18[89]\d|19\d{2}|20\d{2})(?!\d)")
 EXTRA = re.compile(r"(?<!\w)(ncop|nced|creditless[ ._-]*(?:opening|ending)|trailer|sample|трейлер)(?!\w)", re.I)
-BROKEN = re.compile(r"(?:\.!qB|\.part|\.crdownload|\.aria2|\.tmp)$", re.I)
+BROKEN = re.compile(r"(?:\.!qB|\.!ut|\.part(?:\.met)?|\.partial|\.crdownload|\.aria2|\.filepart|\.tmp)$", re.I)
 LEADING_GROUP = re.compile(r"^\[[^\]]+\]\s*(?=\S)")
 
 
@@ -56,6 +62,8 @@ class Name:
     season: int | None
     episodes: tuple[int, ...]
     explicit: bool
+    season_conflict: bool = False
+    season_inferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,6 +101,10 @@ class Job:
     target: Path
 
 
+class InputChanged(ValueError):
+    pass
+
+
 def title_key(title):
     return "".join(c for c in unicodedata.normalize("NFKC", title).casefold() if c.isalnum())
 
@@ -107,11 +119,16 @@ def clean_title(value):
     return value.rstrip(" .")
 
 
+def marker_number(match):
+    return int(next(value for value in match.groups() if value is not None))
+
+
 @lru_cache(maxsize=4096)
 def parse_name(value, is_file=True):
     stem = Path(value).stem if is_file else value
     stripped = LEADING_GROUP.sub("", stem).replace("_", " ")
-    match = EPISODE.search(stripped)
+    episode_matches = list(EPISODE.finditer(stripped))
+    match = episode_matches[0] if episode_matches else None
     tech = TECH.search(stripped)
     guess = guessit(value, {"excludes": ["country"], "single_value": False})
     guessed_title = guess.get("title", "")
@@ -120,13 +137,23 @@ def parse_name(value, is_file=True):
     year = guess.get("year")
     if not isinstance(year, int):
         year = None
-    stop = match.start() if match else (tech.start() if tech else len(stripped))
+    metadata_end = tech.start() if tech else len(stripped)
+    stop = match.start() if match else metadata_end
     year_match = next((m for m in YEAR.finditer(stripped[:stop]) if int(m[0]) == year and m.start()), None)
     if year_match:
         stop = year_match.start()
     season_guess = guess.get("season")
-    season_tag = None if match else SEASON_TAG.search(stripped) or SEASON_REVERSE.search(stripped)
-    episode_tag = EPISODE_TAG.search(stripped) if is_file and not match else None
+    episode_tag = EPISODE_TAG.search(stripped, 0, metadata_end) if is_file and not match else None
+    if episode_tag:
+        season_tags = [*SEASON_TAG.finditer(stripped, 0, episode_tag.start()),
+                       *SEASON_TAG.finditer(stripped, episode_tag.end(), metadata_end)]
+    else:
+        season_tags = list(SEASON_TAG.finditer(stripped, 0, metadata_end))
+    season_tag = season_tags[0] if season_tags else None
+    if is_file and not match and not episode_tag:
+        episode_tag = EPISODE_REVERSE.search(stripped, season_tag.end() if season_tag else 0, metadata_end)
+        if not episode_tag and season_tag:
+            episode_tag = EPISODE_REVERSE.search(stripped, 0, season_tag.start())
     date = DATED.search(stripped) if is_file and not match else None
     standalone_season = SEASON.fullmatch(stem)
     episodes = guess.get("episode", ())
@@ -134,28 +161,43 @@ def parse_name(value, is_file=True):
         episodes = (episodes,)
     if not isinstance(episodes, (list, tuple)) or any(type(n) is not int or not 0 <= n <= 9999 for n in episodes):
         episodes = ()
+    if season_tag and is_file and not match and not episode_tag:
+        after = AFTER_SEASON.match(stripped[season_tag.end():metadata_end].rstrip())
+        if after:
+            first = int(after[1])
+            last = int(after[2] or after[1])
+            episodes = tuple(range(first, last + 1)) if last >= first else (first, last)
+        if not episodes and not standalone_season:
+            # A full film title can include the same words, e.g. "Movie TV-4".
+            season_tag = None
+            season_tags = []
     if match:
         season = int(match[1] or match[3])
         first = int(match[2] or match[4])
         episodes = tuple(episodes) if episodes and episodes[0] == first else (first,)
     else:
-        season = int(season_tag[1]) if season_tag else season_guess if isinstance(season_guess, int) else None
-    numbered = NUMBERED.search(stripped[:stop].rstrip())
+        season = marker_number(season_tag) if season_tag else (
+            season_guess if episodes and type(season_guess) is int and 0 <= season_guess <= 999 else None)
+    bare_number = re.fullmatch(r"\d{1,3}(?:v\d+)?", stem, re.I)
+    numbered = next((m for m in NUMBERED.finditer(stripped[:stop].rstrip()) if m.start() or m[1] or bare_number), None)
     if not episodes and numbered and is_file:
         episodes = (int(numbered[1] or numbered[2]),)
     if episode_tag:
-        episodes = (int(episode_tag[1]),)
+        first = marker_number(episode_tag)
+        sequence = EPISODE_RANGE.match(stripped[episode_tag.end():metadata_end])
+        last = int(sequence[1]) if sequence else first
+        episodes = tuple(range(first, last + 1)) if last >= first else (first, last)
         stop = min(stop, episode_tag.start())
     if date:
         stop = min(stop, date.start())
-    if numbered and episodes and numbered.start() < stop and not match:
+    if numbered and episodes and int(numbered[1] or numbered[2]) == episodes[0] and numbered.start() < stop and not match:
         stop = numbered.start()
     if season_tag and season_tag.start():
         stop = min(stop, season_tag.start())
     if not is_file and PACK.search(stripped):
         stop = min(stop, PACK.search(stripped).start())
     prefix = stripped[:stop].strip(" ._-[]()")
-    if standalone_season or (is_file and episodes and (not prefix or re.fullmatch(r"\d{1,3}(?:v\d+)?", stem, re.I))):
+    if standalone_season or (is_file and episodes and (not prefix or bare_number)):
         title = ""
     elif prefix and (stop < len(stripped) or match):
         title = clean_title(re.split(r"\s+[|=]\s+", prefix, maxsplit=1)[0].replace(".", " "))
@@ -167,10 +209,17 @@ def parse_name(value, is_file=True):
         title = clean_title(prefix.replace(".", " ").replace("_", " "))
     if title.isdecimal() and year == int(title):
         year = None
-    return Name(title, year, season, tuple(episodes), bool(match or season_tag))
+    explicit_seasons = {int(m[1] or m[3]) for m in episode_matches}
+    explicit_seasons.update(marker_number(m) for m in season_tags)
+    season_conflict = len(explicit_seasons) > 1
+    return Name(title, year, season, tuple(episodes), bool(match or season_tag), season_conflict)
 
 
-def scan_files(root):
+def is_release_subfolder(name):
+    return bool(SEASON.fullmatch(name) or name.strip("[]()").casefold() in AUX_DIRS | EXTRA_DIRS)
+
+
+def scan_files(root, *, shared=False):
     video_files, sidecars, unfinished = [], [], []
     def fail(error):
         raise error
@@ -178,12 +227,13 @@ def scan_files(root):
     for directory, dirs, files in os.walk(root, onerror=fail):
         here = Path(directory)
         dirs[:] = [d for d in dirs if not d.startswith(".") and d.casefold() not in SKIP_DIRS
-                   and not (here / d).is_symlink()]
+                   and not (here / d).is_symlink()
+                   and (not shared or here != root or is_release_subfolder(d))]
         for name in files:
             path = here / name
             suffix = path.suffix.lower()
             partial = BROKEN.search(name)
-            if name.startswith(".") or (not partial and suffix not in VIDEOS | AUDIO | SUBTITLES):
+            if not partial and (name.startswith(".") or suffix not in VIDEOS | AUDIO | SUBTITLES):
                 continue
             if path.is_symlink() or not path.is_file():
                 continue
@@ -243,7 +293,8 @@ def releases_in(root):
         for path in paths:
             for ancestor in path.parents:
                 if ancestor in by_parent:
-                    index[ancestor].append(path)
+                    if ancestor != root or path.parent == root or is_release_subfolder(path.relative_to(root).parts[0]):
+                        index[ancestor].append(path)
                     break
                 if ancestor == root:
                     break
@@ -341,11 +392,14 @@ def releases_in(root):
                 warnings.append("Папка похожа на сборник")
             if len(groups) == 1 and unmatched:
                 warnings.append(f"Не сопоставлены дорожки ({len(unmatched)}): " + ", ".join(unmatched[:3]))
+            if folder_name.season_conflict or any(name.season_conflict for _, name in group):
+                warnings.append("В одном имени указаны разные сезоны")
             for path, name in group:
                 parent_season = SEASON.fullmatch(path.parent.name)
                 season = name.season
+                season_inferred = False
                 if name.episodes:
-                    from_folder = int(parent_season[1]) if parent_season else folder_name.season
+                    from_folder = marker_number(parent_season) if parent_season else folder_name.season
                     if season is not None and from_folder is not None and season != from_folder:
                         warnings.append("Номер сезона в имени отличается от папки")
                     if season is not None and from_folder is None and not name.explicit:
@@ -355,6 +409,7 @@ def releases_in(root):
                     if season is None:
                         warnings.append("Сезон не указан. В плане предложен сезон 01")
                         season = 1
+                        season_inferred = True
                 elif kind == "show":
                     warnings.append("Есть видео без номера серии")
                 if BROKEN.search(path.name):
@@ -362,7 +417,7 @@ def releases_in(root):
                 tracks = tuple(sorted(matches[path], key=lambda t: str(t.path).casefold()))
                 if len({(t.kind, t.name.casefold(), t.language, t.forced, t.path.suffix.lower()) for t in tracks}) != len(tracks):
                     warnings.append("Найдены дорожки с одинаковыми названиями")
-                entries.append(Entry(path, replace(name, season=season), tracks))
+                entries.append(Entry(path, replace(name, season=season, season_inferred=season_inferred), tracks))
             entries.sort(key=lambda item: (item.name.season or 0, item.name.episodes or (99999,), item.source.name.casefold()))
             if len(groups) == 1:
                 for path in extras.get(folder, []):
@@ -426,3 +481,8 @@ def fingerprint(path):
 def release_stamp(release):
     files = sorted({e.source for e in release.entries} | {t.path for e in release.entries for t in e.tracks})
     return tuple((str(path), fingerprint(path)) for path in files)
+
+
+def release_activity_stamp(folder, *, shared):
+    videos, tracks, unfinished = scan_files(folder, shared=shared)
+    return tuple((str(path), fingerprint(path)) for path in sorted((*videos, *tracks, *unfinished)))

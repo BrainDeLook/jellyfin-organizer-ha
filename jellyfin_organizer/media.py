@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 
-from organizer import BROKEN, VIDEOS, fingerprint
+from organizer import BROKEN, VIDEOS, InputChanged, fingerprint
 
 
 FFMPEG = os.environ.get("FFMPEG", "ffmpeg")
@@ -285,7 +285,7 @@ def cleanup_pending(database, roots, *, whole_release=False):
     return removed, warnings
 
 
-def import_jobs(jobs, config, database, report, *, whole_folder=None):
+def import_jobs(jobs, config, database, report, *, whole_folder=None, check_inputs=None):
     warnings = []
     whole = None
     if whole_folder is not None:
@@ -344,8 +344,10 @@ def import_jobs(jobs, config, database, report, *, whole_folder=None):
                             if error.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES, errno.ENOSYS, errno.EOPNOTSUPP):
                                 raise
                             shutil.copy2(source, target)
-                if before != job_inputs(job) or not all(p.stat().st_size > 0 for p in staged):
-                    raise ValueError("Входные файлы изменились во время импорта или результат пуст.")
+                if before != job_inputs(job):
+                    raise InputChanged("Входные файлы изменились во время импорта.")
+                if not all(p.stat().st_size > 0 for p in staged):
+                    raise ValueError("Результат импорта пуст.")
                 published = []
                 try:
                     # Publish the video last, so Jellyfin sees any external tracks on its first scan.
@@ -366,5 +368,7 @@ def import_jobs(jobs, config, database, report, *, whole_folder=None):
                         final.unlink()
                     raise
         if jobs:
+            if check_inputs is not None:
+                check_inputs()
             queue_cleanup(connection, jobs, config.cleanup_inputs, warnings, whole)
     return warnings

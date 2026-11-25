@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty, Full, Queue
 from urllib.parse import parse_qs, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import Request, build_opener
 import argparse
 import json
 import secrets
@@ -14,8 +14,10 @@ import subprocess
 import threading
 import time
 
+from anime_mapping import AnimeMappingConflict, load_anime_mappings, lookup_anime_episodes
+from catalog import NoRedirect, apply_catalog, catalog_query, resolve_catalog, unplaced_episodes
 from media import cleanup_pending, import_jobs
-from organizer import Job, Release, clean_title, jobs_for, release_stamp, releases_in
+from organizer import InputChanged, Job, Release, clean_title, jobs_for, release_activity_stamp, release_stamp, releases_in
 
 
 @dataclass
@@ -34,6 +36,8 @@ class Config:
     base_url: str = "https://api.tokenclub.cc/v1"
     cleanup_inputs: tuple[Path, ...] = ()
     cleanup_whole_release: bool = False
+    tmdb_read_token: str = ""
+    anibridge_mappings: Path | None = None
 
 
 def load_config(options, local=False):
@@ -59,7 +63,8 @@ def load_config(options, local=False):
                   options["auto_import"], options["embed_tracks"], options["preferred_audio"].strip(),
                   options["keep_original_audio_default"], options["tokenclub_model"].strip(),
                   options["tokenclub_api_key"].strip(), options.get("tokenclub_base_url", "https://api.tokenclub.cc/v1").rstrip("/"),
-                  cleanup, options.get("cleanup_whole_release", False))
+                  cleanup, options.get("cleanup_whole_release", False), options.get("tmdb_read_token", "").strip(),
+                  path(options["anibridge_mappings"]) if options.get("anibridge_mappings") else None)
 
 
 def read_override(values):
@@ -75,11 +80,6 @@ def read_override(values):
                 raise ValueError(f"Ожидается число от {low} до {high}.")
             result[key] = int(value)
     return result
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
 
 
 def suggest(release, config):
@@ -122,6 +122,15 @@ class Card:
     error: str
     imported: bool = False
     approved: bool = False
+    metadata: str = ""
+    plan_stamp: str = ""
+
+
+@dataclass(frozen=True)
+class ImportFailure:
+    message: str
+    attempts: int
+    retry_at: float
 
 
 class Organizer:
@@ -134,17 +143,71 @@ class Organizer:
         self.observed = {}
         self.completed = set()
         self.import_notes = {}
-        self.auto_failed = set()
+        self.auto_failed = {}
         self.cards = {}
         self.queue = Queue(maxsize=20)
         self.notice = "Ожидание первого сканирования"
         self.scan_notice = setup_error
         self.setup_error = setup_error
         self.nonce = secrets.token_urlsafe(32)
+        self.anime_mappings = None
+        self.metadata_notice = ""
+        self.catalog_results = {}
+        self.catalog_next_request = 0.0
+        if config and config.anibridge_mappings:
+            try:
+                self.anime_mappings = load_anime_mappings(config.anibridge_mappings)
+            except (OSError, ValueError) as exc:
+                self.metadata_notice = f"База AniBridge недоступна: {exc}"
 
     def report(self, message):
         self.notice = message
         print(message, flush=True)
+
+    def resolve_release(self, release, now):
+        episodes = unplaced_episodes(release)
+        if self.anime_mappings is not None and episodes:
+            entries = tuple(entry for entry in release.entries if not entry.extra)
+            try:
+                placement = lookup_anime_episodes(self.anime_mappings, release.folder.name,
+                                                  (entry.source.name for entry in entries),
+                                                  episodes)
+            except AnimeMappingConflict:
+                return replace(release, warnings=(*release.warnings, "Найдено несколько несовместимых сопоставлений AniBridge.")), ""
+            if placement is not None:
+                return apply_catalog(release, placement.season, placement.episodes), "Сезон подтверждён базой AniBridge."
+        query = catalog_query(release, episodes)
+        if query is None:
+            return release, ""
+        if not self.config.tmdb_read_token:
+            return release, ""
+        checked = self.catalog_results.get(query)
+        if (checked is None or now >= checked[0]) and now >= self.catalog_next_request:
+            self.catalog_next_request = now + max(15, self.config.interval)
+            try:
+                value = resolve_catalog(self.config.tmdb_read_token, query)
+            except (OSError, ValueError) as exc:
+                self.metadata_notice = f"TMDB недоступен ({type(exc).__name__}). Повторим позже."
+                self.catalog_next_request = now + max(60, self.config.interval)
+            else:
+                if len(self.catalog_results) >= 256:
+                    self.catalog_results.pop(next(iter(self.catalog_results)))
+                checked = (now + (86400 if value is not None else 3600), value)
+                self.catalog_results[query] = checked
+                self.metadata_notice = ""
+        if checked is None or now >= checked[0] or checked[1] is None:
+            return release, ""
+        return apply_catalog(release, checked[1]), "Данные подтверждены каталогом TMDB."
+
+    def import_failure(self, card, stamp, exc):
+        key = (card.release.key, stamp)
+        previous = self.auto_failed.get(key)
+        attempts = previous.attempts + 1 if previous else 1
+        retryable = isinstance(exc, (OSError, sqlite3.OperationalError, subprocess.TimeoutExpired, InputChanged))
+        delay = min(300, max(15, self.config.interval) * 2 ** min(3, attempts - 1))
+        retry_at = time.monotonic() + delay if retryable else float("inf")
+        self.auto_failed = {**self.auto_failed, key: ImportFailure(str(exc), attempts, retry_at)}
+        self.report(f"{card.release.title}: {exc}")
 
     def scan(self, automatic=False):
         config = self.config
@@ -171,15 +234,24 @@ class Organizer:
         next_seen, cards, claimed, failures = {}, {}, {}, []
         for folder in config.inputs:
             try:
+                activity_by_folder = {}
                 for release in releases_in(folder):
                     stamp = release_stamp(release)
+                    if release.folder not in activity_by_folder:
+                        activity_by_folder[release.folder] = release_activity_stamp(release.folder, shared=release.folder == folder)
+                    activity = activity_by_folder[release.folder]
                     previous = self.observed.get(release.key)
-                    since = previous[1] if previous and previous[0] == stamp else now
-                    next_seen[release.key] = (stamp, since)
+                    since = previous[1] if previous and (previous[0], previous[2]) == (stamp, activity) else now
+                    next_seen[release.key] = (stamp, since, activity)
                     error = release.hard_block
                     jobs = ()
                     approved = self.approved.get(release.key, {})
-                    approval_matches = approved.get("_stamp") == sha256(repr(stamp).encode()).hexdigest()
+                    plan_stamp = sha256(repr(stamp).encode()).hexdigest()
+                    approval_matches = approved.get("_stamp") == plan_stamp
+                    ready = now - since >= config.stable
+                    metadata = ""
+                    if ready and not error and not approval_matches:
+                        release, metadata = self.resolve_release(release, now)
                     try:
                         jobs = tuple(jobs_for(release, config.movies, config.shows, config.embed,
                                               approved if approval_matches else None))
@@ -188,7 +260,7 @@ class Organizer:
                     for job in jobs:
                         claimed.setdefault(job.target.with_suffix("").as_posix().casefold(), set()).add(release.key)
                     imported = (release.key, stamp) in self.completed and all(j.target.is_file() for j in jobs)
-                    cards[release.key] = Card(release, jobs, now - since >= config.stable, error, imported, approval_matches)
+                    cards[release.key] = Card(release, jobs, ready, error, imported, approval_matches, metadata, plan_stamp)
             except OSError as exc:
                 failures.append(str(exc))
         for keys in claimed.values():
@@ -198,34 +270,40 @@ class Organizer:
         self.observed, self.cards = next_seen, cards
         live = {(key, state[0]) for key, state in next_seen.items()}
         self.completed.intersection_update(live)
-        self.auto_failed.intersection_update(live)
+        self.auto_failed = {key: value for key, value in self.auto_failed.items() if key in live}
         self.scan_notice = " · ".join(failures) if failures else f"Сканирование {time.strftime('%H:%M:%S')} · релизов {len(cards)}"
 
         if automatic and config.auto and not failures:
             for key, card in cards.items():
                 stamp = next_seen[key][0]
-                if (card.ready and not card.error and not card.imported and (key, stamp) not in self.auto_failed
+                failure = self.auto_failed.get((key, stamp))
+                if (card.ready and not card.error and not card.imported and (failure is None or now >= failure.retry_at)
                         and (not card.release.warnings or card.approved)):
                     try:
                         self.apply(card)
                     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
-                        self.auto_failed.add((key, stamp))
-                        self.report(f"{card.release.title}: {exc}")
+                        self.import_failure(card, stamp, exc)
 
     def apply(self, card):
         key = card.release.key
         if card.error or not card.ready or not card.jobs or (card.release.warnings and not card.approved):
             raise ValueError(card.error or "Импорт ждёт готовности файлов или подтверждения плана.")
-        stamp = self.observed[key][0]
-        if release_stamp(card.release) != stamp:
-            raise ValueError("Входные файлы изменились. Дождись нового сканирования.")
+        stamp, _, activity = self.observed[key]
         folder = card.release.folder
+
+        def check_inputs():
+            if (release_stamp(card.release) != stamp
+                    or release_activity_stamp(folder, shared=folder in self.config.inputs) != activity):
+                raise InputChanged("Входные файлы изменились. Дождись нового сканирования.")
+
+        check_inputs()
         whole_folder = folder if (
             self.config.cleanup_whole_release and folder.parent in self.config.cleanup_inputs
             and not any(other.release.key != key and other.release.folder.is_relative_to(folder)
                         for other in self.cards.values())
         ) else None
-        notes = import_jobs(card.jobs, self.config, self.database, self.report, whole_folder=whole_folder)
+        notes = import_jobs(card.jobs, self.config, self.database, self.report,
+                            whole_folder=whole_folder, check_inputs=check_inputs)
         removed = 0
         if self.config.cleanup_inputs:
             try:
@@ -238,6 +316,7 @@ class Organizer:
         for note in notes:
             print(note, flush=True)
         self.completed.add((key, stamp))
+        self.auto_failed = {item: failure for item, failure in self.auto_failed.items() if item != (key, stamp)}
         self.cards = {**self.cards, key: replace(card, imported=True)}
         self.report(f"Готово · {card.release.title}"
                     + (f" · исходников удалено: {removed}" if removed else "")
@@ -265,7 +344,10 @@ class Organizer:
                     self.report("Предложение ИИ показано в форме. Проверь и сохрани подходящий вариант.")
                 elif action == "save":
                     plan = read_override(fields)
-                    plan["_stamp"] = sha256(repr(self.observed[key][0]).encode()).hexdigest()
+                    self.scan()
+                    plan["_stamp"] = self.cards[key].plan_stamp
+                    if fields.get("stamp") != plan["_stamp"]:
+                        raise InputChanged("Состав релиза изменился. Проверь обновлённый план.")
                     approved = {**self.approved, key: plan}
                     temporary = self.config_path.with_suffix(".tmp")
                     temporary.write_text(json.dumps(approved, ensure_ascii=False), encoding="utf-8")
@@ -273,12 +355,16 @@ class Organizer:
                     self.approved = approved
                     self.suggestions = {k: v for k, v in self.suggestions.items() if k != key}
                     self.completed = {item for item in self.completed if item[0] != key}
-                    self.auto_failed = {item for item in self.auto_failed if item[0] != key}
+                    self.auto_failed = {item: failure for item, failure in self.auto_failed.items() if item[0] != key}
                     self.scan()
                     self.report("План сохранён.")
                 elif action == "import":
                     self.scan()
-                    self.apply(self.cards[key])
+                    card = self.cards[key]
+                    try:
+                        self.apply(card)
+                    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
+                        self.import_failure(card, self.observed[key][0], exc)
             except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, sqlite3.Error,
                     subprocess.SubprocessError) as exc:
                 if action == "suggest":
@@ -313,6 +399,7 @@ def render(app):
         return f'<label>{label}<input name="{name}" value="{text}"{width}></label>'
 
     sections = []
+    observed, failed = app.observed, app.auto_failed
     cards = sorted(app.cards.values(), key=lambda card: (card.imported, card.release.title.casefold()))
     for card in cards:
         release = card.release
@@ -322,8 +409,11 @@ def render(app):
         proposed = suggestion or approved
         displayed = approved.get("title", release.title) or release.folder.name
         review = card.error or (release.warnings and not approved)
-        status = "Импортировано" if card.imported else "Проверить" if review else "Готово" if card.ready else "Ожидание"
-        details = " · ".join(release.warnings + ((card.error,) if card.error else ()))
+        failure = failed.get((key, observed[key][0])) if key in observed and not card.imported else None
+        status = ("Импортировано" if card.imported else "Проверить" if review else
+                  "Ошибка импорта" if failure else "Готово" if card.ready else "Ожидание")
+        details = " · ".join(filter(None, (*release.warnings, card.error,
+                                           failure.message if failure else "", card.metadata)))
         notes = app.import_notes.get(key, []) if card.imported else []
         rows = []
         for job in card.jobs:
@@ -338,6 +428,7 @@ def render(app):
             selected = " selected" if kind == value else ""
             options.append(f'<option value="{value}"{selected}>{label}</option>')
         editor = (f'<form class="fields" method="post" action="./action">{hidden}<input type="hidden" name="key" value="{key}">'
+                  f'<input type="hidden" name="stamp" value="{card.plan_stamp}">'
                   + field("title", "Название", proposed.get("title", release.title))
                   + '<label>Тип<select name="kind">' + "".join(options) + '</select></label>'
                   + field("year", "Год", proposed.get("year", release.year), True)
@@ -346,7 +437,7 @@ def render(app):
                   + '<button name="action" value="save">Сохранить план</button></form>')
         actions = ""
         if card.ready and not review and not card.imported:
-            actions += form("import", "Импортировать", key, True)
+            actions += form("import", "Повторить импорт" if failure else "Импортировать", key, True)
         if app.config.model and app.config.api_key:
             actions += form("suggest", "Предложить название через ИИ", key)
         sections.append(f'<article><details><summary><strong>{escape(displayed)}</strong> · {status} · {len(release.entries)} файлов</summary>'
@@ -360,6 +451,7 @@ def render(app):
             f'<title>Jellyfin Organizer</title><style>{STYLE}</style></head><body><main>'
             f'<header><h1>Jellyfin Organizer</h1>{form("scan", "Сканировать")}</header>'
             f'<p>{mode} · {escape(app.scan_notice)}<br><small>{escape(app.notice)}</small></p>'
+            + (f'<p class="warn">{escape(app.metadata_notice)}</p>' if app.metadata_notice else "")
             + "".join(sections) + "</main></body></html>")
 
 

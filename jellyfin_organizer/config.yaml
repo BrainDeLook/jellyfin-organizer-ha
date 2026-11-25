@@ -1,5 +1,5 @@
 name: Jellyfin Organizer
-version: "0.1.3"
+version: "0.1.4"
 slug: jellyfin_organizer
 description: "Подготовка фильмов, сериалов, озвучек и субтитров для Jellyfin"
 image: ghcr.io/braindelook/jellyfin-organizer-ha
@@ -33,6 +33,8 @@ options:
   tokenclub_base_url: "https://api.tokenclub.cc/v1"
   tokenclub_model: ""
   tokenclub_api_key: ""
+  tmdb_read_token: ""
+  anibridge_mappings: ""
 schema:
   input_folders:
     - str
@@ -50,3 +52,5 @@ schema:
   tokenclub_base_url: url
   tokenclub_model: str
   tokenclub_api_key: password
+  tmdb_read_token: password
+  anibridge_mappings: str

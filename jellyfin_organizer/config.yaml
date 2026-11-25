@@ -1,5 +1,5 @@
 name: Jellyfin Organizer
-version: "0.1.1"
+version: "0.1.2"
 slug: jellyfin_organizer
 description: "Подготовка фильмов, сериалов, озвучек и субтитров для Jellyfin"
 image: ghcr.io/braindelook/jellyfin-organizer-ha
@@ -25,6 +25,7 @@ options:
   scan_interval_seconds: 60
   stable_seconds: 90
   auto_import: false
+  cleanup_input_folders: []
   embed_tracks: true
   preferred_audio: "AniDUB"
   keep_original_audio_default: false
@@ -39,6 +40,8 @@ schema:
   scan_interval_seconds: "int(10,86400)"
   stable_seconds: "int(30,86400)"
   auto_import: bool
+  cleanup_input_folders:
+    - str
   embed_tracks: bool
   preferred_audio: str
   keep_original_audio_default: bool

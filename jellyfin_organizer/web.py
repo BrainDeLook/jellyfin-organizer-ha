@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 
-from media import import_jobs
+from media import cleanup_pending, import_jobs
 from organizer import Job, Release, clean_title, jobs_for, release_stamp, releases_in
 
 
@@ -32,6 +32,7 @@ class Config:
     model: str
     api_key: str
     base_url: str = "https://api.tokenclub.cc/v1"
+    cleanup_inputs: tuple[Path, ...] = ()
 
 
 def load_config(options, local=False):
@@ -45,6 +46,9 @@ def load_config(options, local=False):
         return result
 
     inputs = tuple(path(value) for value in options["input_folders"])
+    cleanup = tuple(path(value) for value in options.get("cleanup_input_folders", ()))
+    if not set(cleanup).issubset(inputs):
+        raise ValueError("Для очистки можно указать только целые папки из input_folders.")
     movies, shows = path(options["movies_folder"]), path(options["shows_folder"])
     roots = (*inputs, movies, shows)
     for index, root in enumerate(roots):
@@ -53,7 +57,8 @@ def load_config(options, local=False):
     return Config(inputs, movies, shows, options["scan_interval_seconds"], options["stable_seconds"],
                   options["auto_import"], options["embed_tracks"], options["preferred_audio"].strip(),
                   options["keep_original_audio_default"], options["tokenclub_model"].strip(),
-                  options["tokenclub_api_key"].strip(), options.get("tokenclub_base_url", "https://api.tokenclub.cc/v1").rstrip("/"))
+                  options["tokenclub_api_key"].strip(), options.get("tokenclub_base_url", "https://api.tokenclub.cc/v1").rstrip("/"),
+                  cleanup)
 
 
 def read_override(values):
@@ -150,6 +155,15 @@ class Organizer:
                 self.scan_notice = f"Папка недоступна: {root}"
                 self.cards, self.observed = {}, {}
                 return
+        if automatic and config.cleanup_inputs and self.database.is_file():
+            try:
+                removed, cleanup_notes = cleanup_pending(self.database, config.cleanup_inputs)
+                if removed:
+                    self.report(f"Очистка входной папки · удалено файлов: {removed}")
+                for note in cleanup_notes:
+                    print(note, flush=True)
+            except (OSError, sqlite3.Error) as exc:
+                self.report(f"Очистка входной папки: {exc}")
 
         now = time.monotonic()
         next_seen, cards, claimed, failures = {}, {}, {}, []
@@ -204,12 +218,21 @@ class Organizer:
         if release_stamp(card.release) != stamp:
             raise ValueError("Входные файлы изменились. Дождись нового сканирования.")
         notes = import_jobs(card.jobs, self.config, self.database, self.report)
+        removed = 0
+        if self.config.cleanup_inputs:
+            try:
+                removed, cleanup_notes = cleanup_pending(self.database, self.config.cleanup_inputs)
+                notes.extend(cleanup_notes)
+            except (OSError, sqlite3.Error) as exc:
+                notes.append(f"Очистка входной папки: {exc}")
         self.import_notes = {**self.import_notes, key: notes}
         for note in notes:
             print(note, flush=True)
         self.completed.add((key, stamp))
         self.cards = {**self.cards, key: replace(card, imported=True)}
-        self.report(f"Готово · {card.release.title}" + (f" · замечаний: {len(notes)}" if notes else ""))
+        self.report(f"Готово · {card.release.title}"
+                    + (f" · исходников удалено: {removed}" if removed else "")
+                    + (f" · замечаний: {len(notes)}" if notes else ""))
 
     def run(self):
         next_scan = 0.0

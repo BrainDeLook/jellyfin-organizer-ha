@@ -1,4 +1,5 @@
 from contextlib import closing
+from hashlib import sha256
 from pathlib import Path
 import ctypes
 import errno
@@ -46,15 +47,18 @@ def mux(job, output, preferred, keep_default, source):
     subtitle_count = sum(s["codec_type"] == "subtitle" for s in streams)
     options = []
     warnings = []
+    unused_paths = []
     for track in job.entry.tracks:
         info = probe(track.path)
         selected = [s for s in info["streams"] if s["codec_type"] == track.kind]
         if len(selected) != 1:
+            unused_paths.append(str(track.path))
             warnings.append(f"{job.target.name}: {track.name} пропущена, в файле {len(selected)} подходящих дорожек.")
             continue
         stream = selected[0]
         track_duration = duration(info)
         if track.kind == "audio" and source_duration and track_duration and abs(track_duration - source_duration) > 5:
+            unused_paths.append(str(track.path))
             warnings.append(f"{job.target.name}: {track.name} пропущена, длительность отличается на {abs(track_duration - source_duration):.1f} с.")
             continue
         if track.kind == "subtitle" and source_duration:
@@ -113,7 +117,7 @@ def mux(job, output, preferred, keep_default, source):
                 or bool(stream.get("disposition", {}).get("default")) != (specifier == preferred_stream)
                 or bool(stream.get("disposition", {}).get("forced")) != (flags == "forced")):
             raise ValueError(f"Не подтверждены параметры дорожки {name}.")
-    return warnings
+    return warnings, unused_paths
 
 
 def publish_no_replace(source, target):
@@ -142,6 +146,8 @@ def open_state(path):
     connection = sqlite3.connect(path)
     connection.execute("CREATE TABLE IF NOT EXISTS imports (target TEXT PRIMARY KEY, receipt TEXT NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS import_warnings (target TEXT PRIMARY KEY, warnings TEXT NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS cleanup_receipts (target TEXT PRIMARY KEY, details TEXT NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS cleanup_queue (id TEXT PRIMARY KEY, details TEXT NOT NULL)")
     return connection
 
 
@@ -149,6 +155,102 @@ def job_inputs(job):
     return {str(path): fingerprint(path) for path in (
         job.entry.source, *(track.path for track in job.entry.tracks)
     )}
+
+
+def queue_cleanup(connection, jobs, roots, warnings):
+    if not roots:
+        return
+    folder = next((root for root in roots if all(job.entry.source.is_relative_to(root) for job in jobs)), None)
+    if folder is None:
+        return
+    inputs, outputs, skipped = {}, {}, set()
+    for job in jobs:
+        row = connection.execute("SELECT details FROM cleanup_receipts WHERE target=?", (str(job.target),)).fetchone()
+        if row is None:
+            warnings.append("Исходники сохранены: часть файлов импортирована прежней версией без отметок для очистки.")
+            return
+        record = json.loads(row[0])
+        inputs.update(record["inputs"])
+        outputs.update(record["outputs"])
+        skipped.update(record["skipped"])
+    for path in skipped:
+        inputs.pop(path, None)
+    if not inputs:
+        return
+    payload = json.dumps({"root": str(folder), "inputs": inputs, "outputs": outputs}, ensure_ascii=False, sort_keys=True)
+    with connection:
+        connection.execute("INSERT OR IGNORE INTO cleanup_queue VALUES (?, ?)",
+                           (sha256(payload.encode()).hexdigest(), payload))
+
+
+def cleanup_pending(database, roots):
+    removed, warnings = 0, []
+    allowed = {str(root) for root in roots}
+    with closing(open_state(database)) as connection:
+        rows = connection.execute("SELECT id, details FROM cleanup_queue").fetchall()
+        for key, details in rows:
+            batch = json.loads(details)
+            if batch["root"] not in allowed:
+                continue
+            root = Path(batch["root"])
+            if not root.is_dir() or root.resolve() != root:
+                continue
+            try:
+                for name, expected in batch["outputs"].items():
+                    path = Path(name)
+                    if path.resolve() != path or fingerprint(path) != tuple(expected):
+                        raise ValueError(f"Итоговый файл изменился: {path.name}")
+                    with path.open("rb+" if os.name == "nt" else "rb") as output:
+                        os.fsync(output.fileno())
+                if os.name == "posix":
+                    for folder in {Path(name).parent for name in batch["outputs"]}:
+                        fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
+            except ValueError as exc:
+                warnings.append(f"Очистка отменена. {exc}.")
+                with connection:
+                    connection.execute("DELETE FROM cleanup_queue WHERE id=?", (key,))
+                continue
+            except OSError as exc:
+                warnings.append(f"Очистка отложена. Не удалось проверить или синхронизировать итоговые файлы: {exc}.")
+                continue
+
+            pending, parents = {}, set()
+            for name, expected in batch["inputs"].items():
+                path = Path(name)
+                try:
+                    if not path.is_relative_to(root) or path == root or path.resolve() != path:
+                        warnings.append(f"Исходник сохранён: путь выходит за границы папки очистки ({path.name}).")
+                        continue
+                    if fingerprint(path) != tuple(expected):
+                        warnings.append(f"Исходник сохранён: файл изменился после импорта ({path.name}).")
+                        continue
+                    path.unlink()
+                    removed += 1
+                    parents.update(parent for parent in path.parents if parent != root and parent.is_relative_to(root))
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    pending[name] = expected
+                    warnings.append(f"Очистка отложена для {path.name}: {exc}.")
+            for folder in sorted(parents, key=lambda path: len(path.parts), reverse=True):
+                try:
+                    if folder.resolve() == folder:
+                        folder.rmdir()
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
+                        warnings.append(f"Не удалось убрать пустую папку {folder.name}: {exc}.")
+            with connection:
+                if pending:
+                    batch["inputs"] = pending
+                    connection.execute("UPDATE cleanup_queue SET details=? WHERE id=?",
+                                       (json.dumps(batch, ensure_ascii=False), key))
+                else:
+                    connection.execute("DELETE FROM cleanup_queue WHERE id=?", (key,))
+    return removed, warnings
 
 
 def import_jobs(jobs, config, database, report):
@@ -167,8 +269,9 @@ def import_jobs(jobs, config, database, report):
                 raise ValueError(f"Имена внешних дорожек совпадают: {job.target.name}.")
             if any(path.resolve() != path for path in paths):
                 raise ValueError("Путь назначения проходит через символическую ссылку.")
+            before = job_inputs(job)
             receipt = json.dumps({
-                "inputs": job_inputs(job), "paths": [str(p) for p in paths],
+                "inputs": before, "paths": [str(p) for p in paths],
                 "embed": config.embed, "preferred": config.preferred, "keep_default": config.keep_default,
             }, ensure_ascii=False, sort_keys=True)
             previous = connection.execute("SELECT receipt FROM imports WHERE target=?", (str(job.target),)).fetchone()
@@ -185,7 +288,6 @@ def import_jobs(jobs, config, database, report):
                 raise ValueError(f"Уже есть файл назначения: {exists[0].name}. Требуется проверка.")
             job.target.parent.mkdir(parents=True, exist_ok=True)
             report(f"Обработка {job.target.name}")
-            before = job_inputs(job)
             source_info = probe(job.entry.source)
             if not any(s["codec_type"] == "video" and not s.get("disposition", {}).get("attached_pic")
                        for s in source_info.get("streams", ())):
@@ -193,8 +295,9 @@ def import_jobs(jobs, config, database, report):
             with tempfile.TemporaryDirectory(prefix=".organizer-", dir=job.target.parent) as temporary:
                 staged = [Path(temporary) / path.name for path in paths]
                 job_warnings = []
+                unused = []
                 if config.embed and job.entry.tracks:
-                    job_warnings = mux(job, staged[0], config.preferred, config.keep_default, source_info)
+                    job_warnings, unused = mux(job, staged[0], config.preferred, config.keep_default, source_info)
                 else:
                     for source, target in zip([job.entry.source, *(t.path for t in job.entry.tracks)], staged):
                         try:
@@ -215,9 +318,15 @@ def import_jobs(jobs, config, database, report):
                         connection.execute("INSERT OR REPLACE INTO imports VALUES (?, ?)", (str(job.target), receipt))
                         connection.execute("INSERT OR REPLACE INTO import_warnings VALUES (?, ?)",
                                            (str(job.target), json.dumps(job_warnings, ensure_ascii=False)))
+                        details = {"inputs": before, "outputs": {str(path): fingerprint(path) for path in paths},
+                                   "skipped": unused}
+                        connection.execute("INSERT OR REPLACE INTO cleanup_receipts VALUES (?, ?)",
+                                           (str(job.target), json.dumps(details, ensure_ascii=False)))
                     warnings.extend(job_warnings)
                 except (OSError, sqlite3.Error):
                     for final in published:
                         final.unlink()
                     raise
+        if jobs:
+            queue_cleanup(connection, jobs, config.cleanup_inputs, warnings)
     return warnings

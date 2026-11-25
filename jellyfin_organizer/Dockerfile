@@ -1,4 +1,10 @@
 FROM alpine:3.24
+ARG BUILD_VERSION=dev
+ARG BUILD_ARCH
+LABEL io.hass.version="${BUILD_VERSION}" \
+      io.hass.arch="${BUILD_ARCH}" \
+      io.hass.type="app" \
+      org.opencontainers.image.source="https://github.com/BrainDeLook/jellyfin-organizer-ha"
 RUN apk add --no-cache python3 ffmpeg ca-certificates tini \
     && apk add --no-cache --virtual .python-build py3-pip
 WORKDIR /app

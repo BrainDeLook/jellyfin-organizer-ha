@@ -1,0 +1,62 @@
+name: Publish add-on image
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/braindelook/jellyfin-organizer-ha
+
+jobs:
+  image:
+    name: Build and test ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: amd64
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Build and test
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$(sed -n 's/^version: "\(.*\)"$/\1/p' jellyfin_organizer/config.yaml)" = "$version"
+          tag="$IMAGE:$version-$ARCH"
+          docker build --pull --build-arg "BUILD_VERSION=$version" --build-arg "BUILD_ARCH=$ARCH" --tag "$tag" jellyfin_organizer
+          docker run --rm --mount type=bind,source="$PWD/jellyfin_organizer/tests",target=/tests,readonly "$tag" /opt/organizer/bin/python -m unittest discover -s /tests -v
+          docker run --rm "$tag" /opt/organizer/bin/python -c "from web import Handler; assert Handler"
+      - name: Push platform image
+        env:
+          ARCH: ${{ matrix.arch }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:${GITHUB_REF_NAME#v}-$ARCH"
+
+  manifest:
+    name: Publish multi-architecture manifest
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Publish and verify manifest
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx imagetools create --tag "$IMAGE:$version" "$IMAGE:$version-aarch64" "$IMAGE:$version-amd64"
+          docker buildx imagetools inspect "$IMAGE:$version" --raw |
+            jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]'

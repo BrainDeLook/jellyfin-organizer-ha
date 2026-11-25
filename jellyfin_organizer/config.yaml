@@ -1,7 +1,8 @@
 name: Jellyfin Organizer
-version: "0.1.0"
+version: "0.1.1"
 slug: jellyfin_organizer
 description: "Подготовка фильмов, сериалов, озвучек и субтитров для Jellyfin"
+image: ghcr.io/braindelook/jellyfin-organizer-ha
 arch:
   - aarch64
   - amd64
